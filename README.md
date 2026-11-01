@@ -128,6 +128,11 @@ because it's rejected with a `TypeError` before anything changes.
 
 What rollback can't promise:
 
+- No reentry from outside the arguments. The input contract keeps caller code
+  that arrives *through the arguments* out of an update. But a Python signal
+  handler (say, for SIGALRM) runs between bytecodes, and if it mutates the same
+  ATMS mid-update, it re-enters. So does code that monkeypatches the class. Don't
+  mutate one ATMS from a signal handler or another thread.
 - It assumes the undo records themselves run. If a second interrupt or
   allocation failure hits *during* rollback, the state can be left partly
   restored, and nothing detects that.
