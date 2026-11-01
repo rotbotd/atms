@@ -65,7 +65,7 @@ computes its antichains itself rather than calling this library's `minimize`,
 and it checks the labels after every single insertion: 2,500 networks, over
 20,000 intermediate states.
 
-A second test checks that every explanation uses only real justifications and
+Another test checks that every explanation uses only real justifications and
 never explains a node by a chain that loops back to itself, including when the
 rules themselves are cyclic.
 
