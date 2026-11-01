@@ -196,13 +196,19 @@ class DeepAndFailureTest(unittest.TestCase):
             (tree,), depth = tree["from"], depth + 1
         self.assertEqual((tree["node"], tree["because"], depth), ("A", "assumed", self.N))
 
+    @staticmethod
+    def snapshot(t):
+        """Everything a mutation can change: node set, labels, assumption flags,
+        justification and consumer lists, and nogoods."""
+        return ({k: (frozenset(v.label), v.is_assumption, tuple(v.justifications), tuple(v.consumers))
+                 for k, v in t.nodes.items()}, frozenset(t.nogoods))
+
     def test_failed_update_rolls_back_and_retry_completes(self):
         t = ATMS()
         for i in range(50):
             t.justify(f"n{i}", ["A" if i == 0 else f"n{i-1}"], "chain")
         t.contradiction(["n49"], "the chain cannot hold")
-        before = (dict((k, set(v.label)) for k, v in t.nodes.items()), set(t.nogoods),
-                  {k: len(v.justifications) for k, v in t.nodes.items()})
+        before = self.snapshot(t)
 
         real, calls = ATMS._candidates, [0]
         def failing(self, j):
@@ -217,12 +223,22 @@ class DeepAndFailureTest(unittest.TestCase):
         finally:
             ATMS._candidates = real
 
-        after = (dict((k, set(v.label)) for k, v in t.nodes.items()), set(t.nogoods),
-                 {k: len(v.justifications) for k, v in t.nodes.items()})
+        after = self.snapshot(t)
         self.assertEqual(after, before)  # nothing half-done is visible
         self.assertFalse(t.holds_in("n0", {"A"}))
         t.assume("A")  # the retry does the whole job
         self.assertEqual(t.nogoods, {frozenset({"A"})})
+
+        # a failing justify must also undo new nodes and rule wiring
+        before = self.snapshot(t)
+        ATMS._candidates = lambda self, j: (_ for _ in ()).throw(KeyboardInterrupt())
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                t.justify("brand new", ["n3", "also new"], "fails while firing")
+        finally:
+            ATMS._candidates = real
+        self.assertEqual(self.snapshot(t), before)
+        self.assertNotIn("brand new", t.nodes)
 
 
 class LynnIndependentOracleTest(unittest.TestCase):
