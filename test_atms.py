@@ -164,5 +164,121 @@ class EdgeTest(unittest.TestCase):
             ATMS().assume(ATMS.CONTRADICTION)
 
 
+class DeepAndFailureTest(unittest.TestCase):
+    """Regressions from Lynn's review of a38de44: recursive propagation hit the
+    stack limit on an 800-node chain and left partial labels queryable."""
+
+    N = 5000
+
+    def chain(self, n, contradiction_at_end=False):
+        t = ATMS()
+        for i in range(n):
+            t.justify(f"n{i}", ["A" if i == 0 else f"n{i-1}"], "chain")
+        if contradiction_at_end:
+            t.contradiction([f"n{n-1}"], "the chain cannot hold")
+        t.assume("A")  # late: every label in the chain changes in one update
+        return t
+
+    def test_deep_chain_propagates_completely(self):
+        t = self.chain(self.N)
+        self.assertEqual(t.label(f"n{self.N-1}"), {frozenset({"A"})})
+
+    def test_far_contradiction_reaches_the_start(self):
+        t = self.chain(self.N, contradiction_at_end=True)
+        self.assertEqual(t.nogoods, {frozenset({"A"})})
+        self.assertFalse(t.holds_in("n0", {"A"}))
+        self.assertEqual(t.label("n0"), set())
+
+    def test_deep_explanation(self):
+        t = self.chain(self.N)
+        tree, depth = t.explain(f"n{self.N-1}", {"A"}), 0
+        while "from" in tree:  # walk it iteratively; == on it would recurse
+            (tree,), depth = tree["from"], depth + 1
+        self.assertEqual((tree["node"], tree["because"], depth), ("A", "assumed", self.N))
+
+    def test_failed_update_rolls_back_and_retry_completes(self):
+        t = ATMS()
+        for i in range(50):
+            t.justify(f"n{i}", ["A" if i == 0 else f"n{i-1}"], "chain")
+        t.contradiction(["n49"], "the chain cannot hold")
+        before = (dict((k, set(v.label)) for k, v in t.nodes.items()), set(t.nogoods),
+                  {k: len(v.justifications) for k, v in t.nodes.items()})
+
+        real, calls = ATMS._candidates, [0]
+        def failing(self, j):
+            calls[0] += 1
+            if calls[0] == 25:
+                raise MemoryError("injected halfway through propagation")
+            return real(self, j)
+        ATMS._candidates = failing
+        try:
+            with self.assertRaises(MemoryError):
+                t.assume("A")
+        finally:
+            ATMS._candidates = real
+
+        after = (dict((k, set(v.label)) for k, v in t.nodes.items()), set(t.nogoods),
+                 {k: len(v.justifications) for k, v in t.nodes.items()})
+        self.assertEqual(after, before)  # nothing half-done is visible
+        self.assertFalse(t.holds_in("n0", {"A"}))
+        t.assume("A")  # the retry does the whole job
+        self.assertEqual(t.nogoods, {frozenset({"A"})})
+
+
+class LynnIndependentOracleTest(unittest.TestCase):
+    """Lynn's independent check (review of a38de44), adopted with credit.
+
+    Its oracle computes antichains with strict subsets itself instead of
+    calling the implementation's `minimize`, and it checks after every
+    insertion prefix, with empty antecedents, assumptions that are also
+    derived, repeated antecedents, and ⊥ as an antecedent.
+    """
+
+    @staticmethod
+    def brute(assumptions, rules, names):
+        subsets = [frozenset(s) for n in range(len(assumptions) + 1)
+                   for s in combinations(sorted(assumptions), n)]
+        closures = {}
+        for s in subsets:
+            known = set(s)
+            while True:
+                nxt = known | {c for c, ants in rules if set(ants) <= known}
+                if nxt == known:
+                    break
+                known = nxt
+            closures[s] = known
+        raw_bad = {s for s in subsets if ATMS.CONTRADICTION in closures[s]}
+        bad = {s for s in raw_bad if not any(t < s for t in raw_bad)}
+        labels = {}
+        for name in names:
+            supports = {s for s in subsets if name in closures[s] and s not in raw_bad}
+            labels[name] = {s for s in supports if not any(t < s for t in supports)}
+        return labels, bad
+
+    def test_every_prefix_matches(self):
+        rng = random.Random(2026110103)
+        names = ["A", "B", "x", "y", ATMS.CONTRADICTION]
+        for case in range(2500):
+            steps = [("assume", a) for a in names[:-1] if rng.random() < .4]
+            steps += [("rule", (rng.choice(names), tuple(rng.choices(names, k=rng.randrange(4)))))
+                      for _ in range(rng.randrange(1, 15))]
+            rng.shuffle(steps)
+            t, assumptions, rules = ATMS(), set(), []
+            for kind, payload in steps:
+                if kind == "assume":
+                    if payload == ATMS.CONTRADICTION:
+                        continue
+                    assumptions.add(payload)
+                    t.assume(payload)
+                else:
+                    rules.append(payload)
+                    t.justify(payload[0], payload[1], "independent test")
+                expected, bad = self.brute(assumptions, rules, names)
+                self.assertEqual(t.nogoods, bad, (case, steps))
+                for name in t.nodes:
+                    if name != ATMS.CONTRADICTION:
+                        self.assertEqual(t.label(name), expected[name], (case, name, steps))
+
+
 if __name__ == "__main__":
     unittest.main()

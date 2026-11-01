@@ -14,7 +14,9 @@ is no negation-as-failure and no disjunction.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
+from functools import wraps
 from itertools import product
 from typing import FrozenSet, Iterable
 
@@ -47,12 +49,39 @@ class Node:
     consumers: list[Justification] = field(default_factory=list)  # using this node
 
 
+def _transactional(method):
+    """Run a mutation all-or-nothing.
+
+    Every state change made during the call is recorded in an undo log. If the
+    call fails partway (any exception, including KeyboardInterrupt or
+    MemoryError), the log is replayed backwards and the exception re-raised.
+    Queries never see labels from an unfinished propagation, and retrying the
+    call starts from a clean state. The cost is proportional to what the call
+    changed, not to the size of the network. Nested calls share one log.
+    """
+    @wraps(method)
+    def run(self, *args, **kwargs):
+        if self._undo is not None:
+            return method(self, *args, **kwargs)
+        self._undo = []
+        try:
+            return method(self, *args, **kwargs)
+        except BaseException:
+            for undo in reversed(self._undo):
+                undo()
+            raise
+        finally:
+            self._undo = None
+    return run
+
+
 class ATMS:
     CONTRADICTION = "⊥"
 
     def __init__(self) -> None:
         self.nodes: dict[str, Node] = {}
         self.nogoods: set[Env] = set()
+        self._undo: list | None = None
         self.node(self.CONTRADICTION)
 
     # ---- construction -------------------------------------------------
@@ -60,15 +89,23 @@ class ATMS:
     def node(self, name: str) -> Node:
         if name not in self.nodes:
             self.nodes[name] = Node(name)
+            self._log(lambda: self.nodes.pop(name))
         return self.nodes[name]
 
+    def _log(self, undo) -> None:
+        if self._undo is not None:
+            self._undo.append(undo)
+
+    @_transactional
     def assume(self, name: str) -> Node:
         """Declare an assumption: it holds exactly in environments containing it."""
         n = self.node(name)
         if name == self.CONTRADICTION:
             raise ValueError("the contradiction cannot be an assumption")
+        was = n.is_assumption
         n.is_assumption = True
-        self._add_envs(n, {frozenset({name})})
+        self._log(lambda: setattr(n, "is_assumption", was))
+        self._propagate(n, {frozenset({name})})
         return n
 
     def premise(self, name: str, informant: str = "premise") -> Node:
@@ -76,13 +113,18 @@ class ATMS:
         self.justify(name, [], informant)
         return self.nodes[name]
 
+    @_transactional
     def justify(self, consequent: str, antecedents: Iterable[str], informant: str) -> Justification:
         """Record: if all antecedents hold, the consequent holds, because `informant`."""
         j = Justification(consequent, tuple(antecedents), informant)
-        self.node(consequent).justifications.append(j)
+        target = self.node(consequent)
+        target.justifications.append(j)
+        self._log(target.justifications.pop)
         for a in j.antecedents:
-            self.node(a).consumers.append(j)
-        self._fire(j)
+            source = self.node(a)
+            source.consumers.append(j)
+            self._log(source.consumers.pop)
+        self._propagate(None, set(), [j])
         return j
 
     def contradiction(self, antecedents: Iterable[str], informant: str) -> Justification:
@@ -94,33 +136,54 @@ class ATMS:
     def _consistent(self, env: Env) -> bool:
         return not any(ng <= env for ng in self.nogoods)
 
-    def _fire(self, j: Justification) -> None:
+    def _candidates(self, j: Justification) -> set[Env]:
         labels = [self.nodes[a].label for a in j.antecedents]
         if any(not label for label in labels):
-            return
-        candidates = {frozenset().union(*combo) for combo in product(*labels)}
-        self._add_envs(self.nodes[j.consequent], candidates)
+            return set()
+        return {frozenset().union(*combo) for combo in product(*labels)}
 
-    def _add_envs(self, node: Node, envs: set[Env]) -> None:
+    def _propagate(self, node: Node | None, envs: set[Env], fire: list[Justification] = ()) -> None:
+        """Add `envs` to `node`, then propagate with an explicit worklist.
+
+        No recursion, so propagation depth is bounded by memory, not the call
+        stack. A justification is fired against the labels current at the time
+        it's popped, so a later, larger label is never lost to a stale snapshot.
+        """
+        queue: deque[Justification] = deque(fire)
+        if node is not None:
+            queue.extend(self._add_envs(node, envs))
+        while queue:
+            j = queue.popleft()
+            queue.extend(self._add_envs(self.nodes[j.consequent], self._candidates(j)))
+
+    def _add_envs(self, node: Node, envs: set[Env]) -> list[Justification]:
+        """Merge envs into node's label; return the justifications to re-fire."""
         envs = {e for e in envs if self._consistent(e)}
         if node.name == self.CONTRADICTION:
             if envs:
                 self._add_nogoods(envs)
-            return
+            return []
         new_label = minimize(node.label | envs)
         if new_label == node.label:
-            return
+            return []
+        old = node.label
         node.label = new_label
-        for j in list(node.consumers):
-            self._fire(j)
+        self._log(lambda: setattr(node, "label", old))
+        return list(node.consumers)
 
     def _add_nogoods(self, envs: set[Env]) -> None:
         merged = minimize(self.nogoods | envs)
         if merged == self.nogoods:
             return
+        old_nogoods = self.nogoods
         self.nogoods = merged
+        self._log(lambda: setattr(self, "nogoods", old_nogoods))
         for n in self.nodes.values():
-            n.label = {e for e in n.label if self._consistent(e)}
+            kept = {e for e in n.label if self._consistent(e)}
+            if kept != n.label:
+                old = n.label
+                n.label = kept
+                self._log(lambda n=n, old=old: setattr(n, "label", old))
 
     # ---- queries ------------------------------------------------------
 
@@ -167,8 +230,23 @@ class ATMS:
                 via[name] = j
 
     def _tree(self, name: str, rank: dict[str, int], via: dict[str, Justification]) -> dict:
-        if name not in via:
-            return {"node": name, "because": "assumed"}
-        j = via[name]
-        return {"node": name, "because": j.informant,
-                "from": [self._tree(a, rank, via) for a in j.antecedents]}
+        """Build the explanation bottom-up, with no recursion, so depth is unbounded."""
+        built: dict[str, dict] = {}
+        for n in sorted(self._needed(name, via), key=lambda n: rank[n]):
+            if n not in via:
+                built[n] = {"node": n, "because": "assumed"}
+            else:
+                j = via[n]
+                built[n] = {"node": n, "because": j.informant,
+                            "from": [built[a] for a in j.antecedents]}
+        return built[name]
+
+    def _needed(self, name: str, via: dict[str, Justification]) -> set[str]:
+        seen, stack = {name}, [name]
+        while stack:
+            j = via.get(stack.pop())
+            for a in (j.antecedents if j else ()):
+                if a not in seen:
+                    seen.add(a)
+                    stack.append(a)
+        return seen

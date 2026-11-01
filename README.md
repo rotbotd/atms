@@ -60,14 +60,36 @@ and none of these depend on the order the facts arrived in. Half the networks
 are dense, with many alternative derivations, so about 300 labels have more
 than one set in them.
 
+A second, independent oracle comes from Lynn's review of the first version. It
+computes its antichains itself rather than calling this library's `minimize`,
+and it checks the labels after every single insertion: 2,500 networks, over
+20,000 intermediate states.
+
 A second test checks that every explanation uses only real justifications and
 never explains a node by a chain that loops back to itself, including when the
 rules themselves are cyclic.
 
-I also broke the code on purpose five ways: no label minimization, no nogood
+I also broke the code on purpose seven ways: no label minimization, no nogood
 minimization, no removal of nogood supersets from labels, no consistency
-filter on new sets, and no propagation to dependent rules. Each break made the
-tests fail.
+filter on new sets, no propagation to dependent rules, no rollback, and the
+whole original recursive version. Each break made the tests fail.
+
+## updates are all-or-nothing
+
+The first version propagated labels recursively. Lynn found that a chain of 800
+rules, with the assumption added last, ran out of Python stack halfway through.
+Worse, the half-finished labels stayed queryable: with a contradiction at the
+far end of the chain, `holds_in('n0', {'A'})` still said yes, although the rules
+on record derive a contradiction from A. A retry then did nothing.
+
+Now propagation uses an explicit worklist, so depth is limited by memory, not
+the call stack. The tests run 5,000-rule chains, with and without a
+contradiction at the far end, and explain a 5,000-step derivation. Every
+mutation (`assume`, `justify`, `premise`, `contradiction`) also keeps an undo log.
+If it fails partway for any reason, every change it made is reversed before
+the exception propagates, so queries only ever see completed updates, and
+retrying starts clean. A test injects a failure halfway through propagation
+and checks both of those.
 
 ## limits
 
@@ -81,5 +103,11 @@ tests fail.
 - It tracks *why* something is believed. It doesn't detect when an external
   cached result has gone stale. Those are different jobs.
 - I built this from my understanding of de Kleer's design, and I didn't
-  re-read the paper first. The tests check it against the definition of a
-  label, not against the paper's algorithm or its terminology.
+  re-read the paper first. Lynn has since compared it with §§4.1–4.7 of the
+  paper and found that the label computation follows the same basic shape:
+  cartesian product of antecedent labels, removing subsumed and inconsistent
+  sets, propagating changes, pruning nogood supersets. Nobody has compared it
+  with the rest of the paper or with its optimized algorithm.
+- `explain()` returns nested dicts. It builds them without recursion, but very
+  deep ones are too deep for Python's recursive tools such as `==` or
+  `json.dumps`.
