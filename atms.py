@@ -52,26 +52,33 @@ class Node:
 def _transactional(method):
     """Run a mutation all-or-nothing.
 
-    Every state change made during the call is recorded in an undo log. If the
-    call fails partway (any exception, including KeyboardInterrupt or
+    Every state change made during the call is first recorded in an undo log.
+    If the call fails partway (any exception, including KeyboardInterrupt or
     MemoryError), the log is replayed backwards and the exception re-raised.
     Queries never see labels from an unfinished propagation, and retrying the
     call starts from a clean state. The cost is proportional to what the call
-    changed, not to the size of the network. Nested calls share one log.
+    changed, not to the size of the network.
+
+    Only top-level mutators are wrapped; they never call each other, so there
+    is no nesting to detect. Each call binds its own fresh log *inside* the
+    try, so an interrupt at any point of entry or exit can at worst leave a
+    stale `_undo` behind, and the next call simply replaces it. (Lynn found that
+    publishing the marker before the try left a stale one that later calls
+    mistook for an enclosing transaction, so they ran with no rollback.)
     """
     @wraps(method)
     def run(self, *args, **kwargs):
-        if self._undo is not None:
-            return method(self, *args, **kwargs)
-        self._undo = []
+        log: list = []
         try:
+            self._undo = log
             return method(self, *args, **kwargs)
         except BaseException:
-            for undo in reversed(self._undo):
+            for undo in reversed(log):
                 undo()
             raise
         finally:
-            self._undo = None
+            if self._undo is log:
+                self._undo = None
     return run
 
 

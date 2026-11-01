@@ -1,4 +1,5 @@
 import random
+import sys
 import unittest
 from itertools import combinations
 
@@ -323,6 +324,76 @@ class FaultSweepTest(unittest.TestCase):
                         self.assertEqual(self.snapshot(t), clean)
                     checked += 1
         self.assertGreater(checked, 40)
+
+
+class InterruptEveryLineTest(unittest.TestCase):
+    """Raise KeyboardInterrupt at the k-th line executed inside atms.py, for
+    every k, during each FaultSweepTest scenario. Covers transaction entry and
+    exit, not just undo registration. Regression for Lynn's third review of
+    dfebd6b: an interrupt between publishing the transaction marker and entering
+    the try left a stale marker, so later calls ran with no rollback at all.
+
+    After the interrupt, the state must be either untouched or the completed
+    update (an interrupt in the final cleanup can land after the work is
+    done). Either way, a later update that fails must still roll back.
+    """
+
+    snapshot = staticmethod(DeepAndFailureTest.snapshot)
+
+    def lines_in(self, op):
+        import atms as module
+        here, n = module.__file__, [0]
+        def tracer(frame, event, arg):
+            if frame.f_code.co_filename == here and event == "line":
+                n[0] += 1
+            return tracer
+        sys.settrace(tracer)
+        try:
+            op()
+        finally:
+            sys.settrace(None)
+        return n[0]
+
+    def test_interrupt_at_every_line(self):
+        import atms as module
+        here = module.__file__
+        sweep = FaultSweepTest()
+        checked = 0
+        for scenario in sweep.scenarios():
+            clean = sweep.run_clean(scenario)
+            t = ATMS(); total = self.lines_in(scenario(t))
+            for k in range(1, total + 1):
+                t = ATMS(); op = scenario(t)
+                before = self.snapshot(t)
+                seen = [0]
+                def tracer(frame, event, arg, k=k):
+                    if frame.f_code.co_filename == here and event == "line":
+                        seen[0] += 1
+                        if seen[0] == k:
+                            raise KeyboardInterrupt(f"line event {k}")
+                    return tracer
+                sys.settrace(tracer)
+                try:
+                    with self.assertRaises(KeyboardInterrupt):
+                        op()
+                finally:
+                    sys.settrace(None)
+                with self.subTest(scenario=scenario.__name__, k=k):
+                    state = self.snapshot(t)
+                    self.assertIn(state, (before, clean))
+                    # a later, separate update that fails must still roll back
+                    t.assume("later")
+                    after_later = self.snapshot(t)
+                    real = ATMS._candidates
+                    ATMS._candidates = lambda self, j: (_ for _ in ()).throw(MemoryError("later failure"))
+                    try:
+                        with self.assertRaises(MemoryError):
+                            t.justify("y", ["later"], "later rule")
+                    finally:
+                        ATMS._candidates = real
+                    self.assertEqual(self.snapshot(t), after_later)
+                checked += 1
+        self.assertGreater(checked, 100)
 
 
 class LynnIndependentOracleTest(unittest.TestCase):

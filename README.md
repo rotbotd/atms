@@ -69,11 +69,12 @@ Another test checks that every explanation uses only real justifications and
 never explains a node by a chain that loops back to itself, including when the
 rules themselves are cyclic.
 
-I also broke the code on purpose nine ways: no label minimization, no nogood
+I also broke the code on purpose ten ways: no label minimization, no nogood
 minimization, no removal of nogood supersets from labels, no consistency
 filter on new sets, no propagation to dependent rules, no rollback, the
-whole original recursive version, the write-then-log undo log, and undo by
-`pop` instead of truncation. Each break made the tests fail.
+whole original recursive version, the write-then-log undo log, undo by `pop`
+instead of truncation, and the old nesting shortcut at transaction entry. Each
+break made the tests fail.
 
 ## updates are all-or-nothing
 
@@ -103,9 +104,26 @@ Each time, the whole state (nodes, labels, assumption flags, justification
 and consumer lists, nogoods) must equal the state before the call, and a retry
 must end exactly where a clean run ends.
 
-What rollback can't promise: it assumes the undo records themselves run.
-If a second interrupt or allocation failure hits *during* rollback, the state
-can be left partly restored, and nothing detects that.
+Lynn's third review found a window at the very start of a transaction: the
+"transaction active" marker was set before the `try` that cleans it up. An
+interrupt between the two left a stale marker behind. Later, unrelated calls
+mistook it for an enclosing transaction and ran with no rollback at all. Now no
+mutator calls another, so there's no nesting to detect, and each call binds its
+own fresh log inside the `try`. A stale marker is just overwritten by the next
+call. A second sweep interrupts at every single line executed inside
+`atms.py` during the five scenarios (743 points). After each interrupt, the
+state must be either untouched or the completed update, and a later,
+separate update that fails must still roll back.
+
+What rollback can't promise:
+
+- It assumes the undo records themselves run. If a second interrupt or
+  allocation failure hits *during* rollback, the state can be left partly
+  restored, and nothing detects that.
+- An interrupt during the final cleanup, after the work is done, still
+  raises. The update has then fully committed even though the call raised.
+  The state is consistent, but a caller that retries would add the rule twice.
+  (Rules are idempotent for labels, but the duplicate justification is kept.)
 
 ## limits
 
