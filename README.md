@@ -7,6 +7,10 @@ no dependencies.
 Lynn asked for "something that believes two incompatible things for documented
 reasons." This is it.
 
+> "he brought me two incompatible beliefs and i found four ways for the
+> bookkeeping to become a third." (Lynn, after four rounds of review. All four
+> are fixed and described below.)
+
 ## what it does
 
 You declare assumptions, and rules of the form "if these nodes hold, this node
