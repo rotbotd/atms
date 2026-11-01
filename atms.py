@@ -82,6 +82,13 @@ def _transactional(method):
     return run
 
 
+def _check_name(name) -> None:
+    # Exactly str: a subclass could run caller code in __hash__/__eq__ when the
+    # name is used as a dict key inside a transaction.
+    if type(name) is not str:
+        raise TypeError(f"node names must be str, not {type(name).__name__}")
+
+
 class ATMS:
     CONTRADICTION = "⊥"
 
@@ -94,6 +101,7 @@ class ATMS:
     # ---- construction -------------------------------------------------
 
     def node(self, name: str) -> Node:
+        _check_name(name)
         if name not in self.nodes:
             self._log(lambda: self.nodes.pop(name, None))
             self.nodes[name] = Node(name)
@@ -111,12 +119,16 @@ class ATMS:
         length = len(items)  # truncate, don't pop: pop would eat an older entry if the append never happened
         self._log(lambda: items.__delitem__(slice(length, None)))
 
-    @_transactional
     def assume(self, name: str) -> Node:
         """Declare an assumption: it holds exactly in environments containing it."""
-        n = self.node(name)
+        _check_name(name)
         if name == self.CONTRADICTION:
             raise ValueError("the contradiction cannot be an assumption")
+        return self._assume(name)
+
+    @_transactional
+    def _assume(self, name: str) -> Node:
+        n = self.node(name)
         was = n.is_assumption
         self._log(lambda: setattr(n, "is_assumption", was))
         n.is_assumption = True
@@ -128,10 +140,27 @@ class ATMS:
         self.justify(name, [], informant)
         return self.nodes[name]
 
-    @_transactional
     def justify(self, consequent: str, antecedents: Iterable[str], informant: str) -> Justification:
-        """Record: if all antecedents hold, the consequent holds, because `informant`."""
-        j = Justification(consequent, tuple(antecedents), informant)
+        """Record: if all antecedents hold, the consequent holds, because `informant`.
+
+        Input contract: `antecedents` is consumed into a tuple, and every name
+        and the informant must be exactly `str`, all *before* the transaction
+        starts. So no caller code (an iterator calling back into this ATMS, a
+        str subclass with its own __hash__ or __eq__) can run inside an update.
+        (Lynn found a generator that called assume() mid-update and left the
+        outer update writing with no undo log.)
+        """
+        _check_name(consequent)
+        antecedents = tuple(antecedents)
+        for a in antecedents:
+            _check_name(a)
+        if type(informant) is not str:
+            raise TypeError(f"informant must be a str, not {type(informant).__name__}")
+        return self._justify(consequent, antecedents, informant)
+
+    @_transactional
+    def _justify(self, consequent: str, antecedents: tuple[str, ...], informant: str) -> Justification:
+        j = Justification(consequent, antecedents, informant)
         target = self.node(consequent)
         self._log_truncate(target.justifications)
         target.justifications.append(j)

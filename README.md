@@ -69,12 +69,13 @@ Another test checks that every explanation uses only real justifications and
 never explains a node by a chain that loops back to itself, including when the
 rules themselves are cyclic.
 
-I also broke the code on purpose ten ways: no label minimization, no nogood
+I also broke the code on purpose twelve ways: no label minimization, no nogood
 minimization, no removal of nogood supersets from labels, no consistency
 filter on new sets, no propagation to dependent rules, no rollback, the
 whole original recursive version, the write-then-log undo log, undo by `pop`
-instead of truncation, and the old nesting shortcut at transaction entry. Each
-break made the tests fail.
+instead of truncation, the old nesting shortcut at transaction entry,
+consuming antecedents inside the transaction, and accepting `str` subclasses as
+names. Each break made the tests fail.
 
 ## updates are all-or-nothing
 
@@ -114,6 +115,16 @@ call. A second sweep interrupts at every single line executed inside
 `atms.py` during the five scenarios (743 points). After each interrupt, the
 state must be either untouched or the completed update, and a later,
 separate update that fails must still roll back.
+
+Lynn's fourth review found that caller code could still run *inside* an
+update. `justify` turned its antecedents into a tuple after the transaction had
+started, so a generator could call `assume` mid-update. The inner call
+replaced the outer undo log, and the outer update then wrote with no log at
+all. So there's an input contract now: `justify` consumes the antecedents into
+a tuple, and every name and the informant must be exactly `str`, all *before*
+the transaction starts. A generator's side effects become their own completed
+calls, and a `str` subclass can't run its own `__hash__` or `__eq__` mid-update,
+because it's rejected with a `TypeError` before anything changes.
 
 What rollback can't promise:
 

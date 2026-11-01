@@ -396,6 +396,58 @@ class InterruptEveryLineTest(unittest.TestCase):
         self.assertGreater(checked, 100)
 
 
+class InputContractTest(unittest.TestCase):
+    """Regression for Lynn's fourth review of fc64848: caller code that runs
+    while justify() consumes its arguments must not run inside the update."""
+
+    snapshot = staticmethod(DeepAndFailureTest.snapshot)
+
+    def test_generator_that_calls_back_in(self):
+        t = ATMS(); t.assume("A"); t.node("x")
+
+        def antecedents():
+            t.assume("B")  # runs before the x update starts: its own completed call
+            yield "A"
+
+        real = ATMS._candidates
+        def fail_x(self, j):
+            if j.consequent == "x":
+                raise MemoryError("outer propagation failed")
+            return real(self, j)
+        ATMS._candidates = fail_x
+        try:
+            with self.assertRaises(MemoryError):
+                t.justify("x", antecedents(), "outer rule")
+        finally:
+            ATMS._candidates = real
+
+        expected = ATMS(); expected.assume("A"); expected.node("x"); expected.assume("B")
+        self.assertEqual(self.snapshot(t), self.snapshot(expected))  # B stays, the x rule is gone
+        self.assertEqual(t.nodes["x"].justifications, [])
+        self.assertFalse(t.holds_in("x", {"A"}))
+
+        t.justify("x", (a for a in ["A"]), "retry")  # and a plain generator still works
+        self.assertEqual(t.label("x"), {frozenset({"A"})})
+
+    def test_str_subclass_names_are_rejected_before_any_change(self):
+        t = ATMS(); t.assume("A")
+        before = self.snapshot(t)
+
+        class Sneaky(str):
+            def __hash__(self):
+                t.assume("hijack")
+                return str.__hash__(self)
+
+        for call in (lambda: t.justify(Sneaky("x"), ["A"], "r"),
+                     lambda: t.justify("x", ["A", Sneaky("y")], "r"),
+                     lambda: t.assume(Sneaky("C")),
+                     lambda: t.justify("x", ["A"], 42),
+                     lambda: t.justify("x", [None], "r")):
+            with self.assertRaises(TypeError):
+                call()
+            self.assertEqual(self.snapshot(t), before)
+
+
 class LynnIndependentOracleTest(unittest.TestCase):
     """Lynn's independent check (review of a38de44), adopted with credit.
 
