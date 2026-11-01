@@ -69,10 +69,11 @@ Another test checks that every explanation uses only real justifications and
 never explains a node by a chain that loops back to itself, including when the
 rules themselves are cyclic.
 
-I also broke the code on purpose seven ways: no label minimization, no nogood
+I also broke the code on purpose nine ways: no label minimization, no nogood
 minimization, no removal of nogood supersets from labels, no consistency
-filter on new sets, no propagation to dependent rules, no rollback, and the
-whole original recursive version. Each break made the tests fail.
+filter on new sets, no propagation to dependent rules, no rollback, the
+whole original recursive version, the write-then-log undo log, and undo by
+`pop` instead of truncation. Each break made the tests fail.
 
 ## updates are all-or-nothing
 
@@ -90,6 +91,21 @@ If it fails partway for any reason, every change it made is reversed before
 the exception propagates, so queries only ever see completed updates, and
 retrying starts clean. A test injects a failure halfway through propagation
 and checks both of those.
+
+The log is write-ahead: each undo record is registered *before* the write it
+guards, and restores the old state by value (an old label, an old list length
+to truncate to), so it's correct whether or not that write happened. Lynn's
+second review found that the first undo log wrote first and logged second, so
+a failure between the two left a label behind with no justification for it.
+A fault sweep now fails at every undo registration in five scenarios, both
+just before and just after the record is appended (72 injected failures).
+Each time, the whole state (nodes, labels, assumption flags, justification
+and consumer lists, nogoods) must equal the state before the call, and a retry
+must end exactly where a clean run ends.
+
+What rollback can't promise: it assumes the undo records themselves run.
+If a second interrupt or allocation failure hits *during* rollback, the state
+can be left partly restored, and nothing detects that.
 
 ## limits
 

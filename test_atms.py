@@ -241,6 +241,90 @@ class DeepAndFailureTest(unittest.TestCase):
         self.assertNotIn("brand new", t.nodes)
 
 
+class FaultSweepTest(unittest.TestCase):
+    """Fail at every undo-log registration in turn, both before the record is
+    appended and right after it (so the guarded write never happens). Each
+    time, the whole state must equal the state before the call, and a retry
+    must end where a clean run ends. Regression for Lynn's follow-up review of
+    5f84542, where a label was written before its undo record and survived
+    rollback with no justification behind it."""
+
+    snapshot = staticmethod(DeepAndFailureTest.snapshot)
+
+    def scenarios(self):
+        def lynn(t):  # Lynn's repro: existing x gains a label from a new rule
+            t.assume("A"); t.node("x")
+            return lambda: t.justify("x", ["A"], "A implies x")
+        def car(t):
+            t.assume("battery dead"); t.assume("starter broken")
+            t.justify("fix", ["battery dead"], "r1"); t.justify("nofix", ["starter broken"], "r2")
+            return lambda: t.contradiction(["fix", "nofix"], "can't both hold")
+        def prune(t):  # a new nogood that prunes several labels
+            t.assume("A"); t.assume("B"); t.assume("C")
+            t.justify("p", ["A", "B"], "r"); t.justify("q", ["A", "C"], "r"); t.justify("r", ["p"], "r")
+            return lambda: t.contradiction(["A"], "A is impossible")
+        def repeated(t):  # same antecedent twice, new nodes on both sides
+            t.assume("A")
+            return lambda: t.justify("new", ["A", "A", "fresh"], "repeat")
+        def chain(t):
+            for i in range(6):
+                t.justify(f"n{i}", ["A" if i == 0 else f"n{i-1}"], "chain")
+            t.contradiction(["n5"], "end")
+            return lambda: t.assume("A")
+        return [lynn, car, prune, repeated, chain]
+
+    def run_clean(self, scenario):
+        t = ATMS(); op = scenario(t); op()
+        return self.snapshot(t)
+
+    def count_logs(self, scenario):
+        t = ATMS(); op = scenario(t)
+        real, n = ATMS._log, [0]
+        def counting(self, undo):
+            if self._undo is not None:
+                n[0] += 1
+            return real(self, undo)
+        ATMS._log = counting
+        try:
+            op()
+        finally:
+            ATMS._log = real
+        return n[0]
+
+    def test_rollback_at_every_registration(self):
+        real = ATMS._log
+        checked = 0
+        for scenario in self.scenarios():
+            clean = self.run_clean(scenario)
+            total = self.count_logs(scenario)
+            self.assertGreater(total, 0)
+            for k in range(1, total + 1):
+                for after in (False, True):
+                    t = ATMS(); op = scenario(t)
+                    before = self.snapshot(t)
+                    calls = [0]
+                    def failing(self, undo, k=k, after=after):
+                        if self._undo is not None:
+                            calls[0] += 1
+                            if calls[0] == k:
+                                if after:
+                                    real(self, undo)
+                                raise MemoryError(f"injected at log {k}, after={after}")
+                        return real(self, undo)
+                    ATMS._log = failing
+                    try:
+                        with self.assertRaises(MemoryError):
+                            op()
+                    finally:
+                        ATMS._log = real
+                    with self.subTest(scenario=scenario.__name__, k=k, after=after):
+                        self.assertEqual(self.snapshot(t), before)
+                        op()  # retry without faults
+                        self.assertEqual(self.snapshot(t), clean)
+                    checked += 1
+        self.assertGreater(checked, 40)
+
+
 class LynnIndependentOracleTest(unittest.TestCase):
     """Lynn's independent check (review of a38de44), adopted with credit.
 

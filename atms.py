@@ -88,13 +88,21 @@ class ATMS:
 
     def node(self, name: str) -> Node:
         if name not in self.nodes:
+            self._log(lambda: self.nodes.pop(name, None))
             self.nodes[name] = Node(name)
-            self._log(lambda: self.nodes.pop(name))
         return self.nodes[name]
 
+    # Write-ahead: every write is preceded by an undo record that restores the
+    # old state *by value*, so the record is correct whether or not the write
+    # it guards ever happened. (Lynn found the write-then-log version could
+    # fail between the two and leave an unrecorded label behind.)
     def _log(self, undo) -> None:
         if self._undo is not None:
             self._undo.append(undo)
+
+    def _log_truncate(self, items: list) -> None:
+        length = len(items)  # truncate, don't pop: pop would eat an older entry if the append never happened
+        self._log(lambda: items.__delitem__(slice(length, None)))
 
     @_transactional
     def assume(self, name: str) -> Node:
@@ -103,8 +111,8 @@ class ATMS:
         if name == self.CONTRADICTION:
             raise ValueError("the contradiction cannot be an assumption")
         was = n.is_assumption
-        n.is_assumption = True
         self._log(lambda: setattr(n, "is_assumption", was))
+        n.is_assumption = True
         self._propagate(n, {frozenset({name})})
         return n
 
@@ -118,12 +126,12 @@ class ATMS:
         """Record: if all antecedents hold, the consequent holds, because `informant`."""
         j = Justification(consequent, tuple(antecedents), informant)
         target = self.node(consequent)
+        self._log_truncate(target.justifications)
         target.justifications.append(j)
-        self._log(target.justifications.pop)
         for a in j.antecedents:
             source = self.node(a)
+            self._log_truncate(source.consumers)
             source.consumers.append(j)
-            self._log(source.consumers.pop)
         self._propagate(None, set(), [j])
         return j
 
@@ -167,8 +175,8 @@ class ATMS:
         if new_label == node.label:
             return []
         old = node.label
-        node.label = new_label
         self._log(lambda: setattr(node, "label", old))
+        node.label = new_label
         return list(node.consumers)
 
     def _add_nogoods(self, envs: set[Env]) -> None:
@@ -176,14 +184,14 @@ class ATMS:
         if merged == self.nogoods:
             return
         old_nogoods = self.nogoods
-        self.nogoods = merged
         self._log(lambda: setattr(self, "nogoods", old_nogoods))
+        self.nogoods = merged
         for n in self.nodes.values():
             kept = {e for e in n.label if self._consistent(e)}
             if kept != n.label:
                 old = n.label
-                n.label = kept
                 self._log(lambda n=n, old=old: setattr(n, "label", old))
+                n.label = kept
 
     # ---- queries ------------------------------------------------------
 
